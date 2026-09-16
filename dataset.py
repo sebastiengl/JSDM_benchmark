@@ -14,6 +14,7 @@ class SpeciesVocab():
             train_presence = train_species.iloc[:,1:].sum()
             test_presence = test_species.iloc[:,1:].sum()
             presence = (train_presence + test_presence > 0)
+
             all_species = np.arange(0,len(train_presence), dtype = int)[presence]
             self.species_counts = {i: int(train_presence.iloc[i]) for i in range(len(train_presence))}
 

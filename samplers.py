@@ -155,3 +155,28 @@ class AutoRegSampler(BaseSampler):
         self.model.train()
         return samples
 
+
+
+class CSVSampler(BaseSampler):
+    def __init__(self, model = None, vocab = None, file_path = None, id_name = "survey_id"):
+        import pandas as p
+        super().__init__(model, vocab)
+        self.vocab_size = vocab.size
+        self.nb_species = vocab.nb_species
+        self.file = p.read_csv(file_path)
+        self.file.drop(columns= ["row_id", "fold", "draw"], inplace=True)
+        self.id_name = id_name
+        id = self.file.iloc[0][id_name]
+        self.nb_sample = len(self.file[self.file[id_name] == id])
+
+    def sample(self, y, nb = 1, survey_id = None):
+        assert nb <= self.nb_sample, "Not enough samples in the CSV file"
+        B = y[0].shape[0]
+        samples = torch.zeros((B, nb, self.vocab.nb_species), device=y[0].device)
+        for i in range(B):
+            id = survey_id[i]
+            row = self.file[self.file[self.id_name] == id]
+            if row.empty:
+                raise ValueError(f"Survey ID {id} not found in the CSV file.")
+            samples[i] = torch.bernoulli(torch.tensor(row.iloc[:, 1:].values, dtype=torch.float32, device=y[0].device))
+        return samples

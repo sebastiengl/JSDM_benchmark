@@ -23,7 +23,7 @@ import os
 from models import MarginalModel, AutoRegModel
 from samplers import SSESampler, MarginalSampler, AutoRegSampler
 from torch.utils.data.distributed import DistributedSampler
-import wandb_utils
+import utils
 import pandas as p
 from dataset import SpeciesVocab, TabularDataset
 from tqdm import tqdm
@@ -177,7 +177,7 @@ def main(args, data):
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger.info(f"Model directory created at {instance_dir}")
         if args.wandb:
-            wandb_utils.initialize(args)
+            utils.initialize(args)
     else:
         logger = create_logger(None)
 
@@ -299,7 +299,7 @@ def main(args, data):
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 if args.wandb:
-                    wandb_utils.log(
+                    utils.log(
                         { "train/loss": avg_loss, "train steps/sec": steps_per_sec },
                         step=train_steps)
                 # Reset monitoring variables:
@@ -404,7 +404,7 @@ def main(args, data):
                         logger.info(f"Train : F1 {train_f1:.3f} | Val : Loss {val_loss:.2e} - F1: {val_f1:.3f}{test_summary}")
                         logger.info("Generating EMA samples done.")
                         if args.wandb:
-                            wandb_utils.log(metrics, step=train_steps)
+                            utils.log(metrics, step=train_steps)
                     dist.barrier()                       
 
 if __name__ == "__main__":

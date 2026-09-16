@@ -129,9 +129,7 @@ class AutoRegModel(nn.Module):
 
         tgt_emb = tgt_emb.transpose(0, 1)  # [L, B, E]
         tgt_emb = torch.cat([bos, tgt_emb], dim=0)
-        #tgt_emb = tgt_emb + context
 
-        # CAT AND NO ADD, TO FIX LATER WITH DECODER EMD_DIM
         tgt_emb = torch.cat([tgt_emb, context.expand(L+1, -1, -1)], dim = -1)# Broadcast context to all positions
 
         tgt_emb = self.dropout(tgt_emb)
@@ -147,28 +145,6 @@ class AutoRegModel(nn.Module):
 
         return self.loss(logits_reshape, target_reshape)
 
-
-
-
-class CSVModel(nn.Module):
-    def __init__(self, vocab, p_file):
-        super().__init__()
-        self.vocab_size = vocab.size
-        self.nb_species = vocab.nb_species
-        self.file = p.read_csv(p_file)
-
-
-    def forward(self, y, _ = None, survey_id = None):
-        if survey_id is None:
-            raise ValueError("survey_id must be provided for this model.")
-        row = self.file[self.file['survey_id'] == survey_id]
-        
-        logits = torch.tensor(row.iloc[0, 1:].values, dtype=torch.float32, device=y.device)
-        return logits.unsqueeze(0)
-
-        
-    def loss_func(self, lgt, tgt, _):
-        pass
 
 
 
