@@ -1,0 +1,9 @@
+configobj
+matplotlib
+numpy
+pandas
+pillow
+torch
+torchvision
+tqdm
+wandb
