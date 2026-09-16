@@ -1,6 +1,3 @@
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 from tkinter import font
 import torch
 from copy import deepcopy
@@ -16,7 +13,7 @@ import pandas as p
 from dataset import SpeciesVocab, TabularDataset
 from tqdm import tqdm
 from config import as_namespace, load_config
-from med_base import init_main, prepare_data, build_loaders, create_logger
+from training import init_main, prepare_data, build_loaders, create_logger
 from samplers import AutoRegSampler, MarginalSampler, CSVSampler
 
 
