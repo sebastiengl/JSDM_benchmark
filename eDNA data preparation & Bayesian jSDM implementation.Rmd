@@ -1,0 +1,514 @@
+---
+title: "eDNA Bayesian joint species distribution model"
+author: "Noémie Coulon"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+<!--
+This script documents the workflow used to prepare eDNA data, fit a spatially
+blocked joint species distribution model (JSDM), evaluate marginal predictions,
+and generate posterior community realisations for best-of-N analyses.
+
+The sample-level eDNA data and environmental covariates required to run this
+workflow are not distributed with the repository. The associated 50-km
+aggregated dataset is provided separately for data sharing and reuse, but does
+not allow the analyses in this script to be rerun. This repository is therefore
+intended as transparent analytical documentation rather than as an executable
+reproducibility package.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Reproducible eDNA analysis
+
+## Dependencies and configuration
+
+Install packages once outside this script (ideally with `renv`). The code does
+not install packages automatically, which makes executions reproducible.
+
+```{r packages}
+required_packages <- c("boral", "blockCV", "dplyr", "readr", "sf", "terra")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_packages)) {
+  stop("Install before running: ", paste(missing_packages, collapse = ", "), call. = FALSE)
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+data_dir <- "data/ecolet"
+output_dir <- "output/ecolet/boral_cv"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+sequence_file <- file.path(data_dir, "seq.csv")
+metadata_file <- file.path(data_dir, "MED_metadatas_2018-2025.csv")
+bathymetry_file <- file.path(data_dir, "gebco_2026_n44.5_s38.5_w0.0_e12.5.nc")
+required_files <- c(sequence_file, metadata_file, bathymetry_file)
+
+if (!all(file.exists(required_files))) {
+  stop("Missing input file(s): ", paste(required_files[!file.exists(required_files)], collapse = ", "), call. = FALSE)
+}
+
+folds <- seq_len(5)
+n_posterior_draws <- 50L
+presence_threshold <- 0.5
+continuous_variables <- c("depth", "volume_sampled", "temperature")
+set.seed(123)
+```
+
+## Helper functions
+
+```{r functions}
+extract_or_nearest <- function(raster, longitude, latitude) {
+  
+  point <- terra::vect(matrix(c(longitude, latitude), ncol = 2), crs = terra::crs(raster))
+  
+  value <- terra::extract(raster, point, cells = TRUE)[[2]]
+  
+  if (!is.na(value)) return(list(value = value, lon = longitude, lat = latitude, replaced = FALSE))
+
+  valid_cells <- which(!is.na(terra::values(raster)))
+  
+  if (!length(valid_cells)) return(list(value = NA_real_, lon = NA_real_, lat = NA_real_, replaced = FALSE))
+  
+  valid_coordinates <- terra::xyFromCell(raster, valid_cells)
+  
+  nearest_cell <- valid_cells[which.min(terra::distance(terra::vect(valid_coordinates, crs = terra::crs(raster)), point))]
+  
+  nearest_coordinates <- terra::xyFromCell(raster, nearest_cell)
+  
+  list(value = terra::values(raster)[nearest_cell], lon = nearest_coordinates[1], lat = nearest_coordinates[2], replaced = TRUE)
+  
+}
+
+micro_f1 <- function(observed, predicted) {
+  true_positive <- sum(observed == 1 & predicted == 1)
+  false_positive <- sum(observed == 0 & predicted == 1)
+  false_negative <- sum(observed == 1 & predicted == 0)
+  denominator <- 2 * true_positive + false_positive + false_negative
+  if (denominator == 0) NA_real_ else 2 * true_positive / denominator
+}
+
+community_f1 <- function(observed, predicted) {
+  true_positive <- rowSums(observed == 1 & predicted == 1)
+  false_positive <- rowSums(observed == 0 & predicted == 1)
+  false_negative <- rowSums(observed == 1 & predicted == 0)
+  denominator <- 2 * true_positive + false_positive + false_negative
+  ifelse(denominator == 0, NA_real_, 2 * true_positive / denominator)
+}
+
+simulate_posterior_probability <- function(fit, mcmc_samples, posterior_row, X_new, ranef_new) {
+  n_samples <- nrow(X_new)
+  n_species <- fit$p
+  n_latent_variables <- fit$num.lv
+  parameter_names <- colnames(mcmc_samples)
+  posterior_draw <- mcmc_samples[posterior_row, , drop = TRUE]
+
+  latent_index <- grep("^lv\\.coefs\\[", parameter_names)
+  if (length(latent_index) != n_species * (n_latent_variables + 1)) stop("Unexpected latent-variable coefficients.")
+  latent_coefficients <- matrix(as.numeric(posterior_draw[latent_index]), nrow = n_species, ncol = n_latent_variables + 1)
+
+  fixed_index <- grep("^X\\.coefs\\[", parameter_names)
+  if (length(fixed_index) != n_species * fit$num.X) stop("Unexpected fixed-effect coefficients.")
+  beta <- matrix(as.numeric(posterior_draw[fixed_index]), nrow = n_species, ncol = fit$num.X)
+
+  linear_predictor <- matrix(latent_coefficients[, 1], nrow = n_samples, ncol = n_species, byrow = TRUE) + X_new %*% t(beta)
+  latent_scores <- matrix(rnorm(n_samples * n_latent_variables), nrow = n_samples)
+  linear_predictor <- linear_predictor + latent_scores %*% t(latent_coefficients[, -1, drop = FALSE])
+
+  for (random_effect in seq_len(ncol(ranef_new))) {
+    sd_index <- grep(paste0("^ranef\\.sigma\\.ID", random_effect, "\\["), parameter_names)
+    if (length(sd_index) != n_species) stop("Unexpected random-effect standard deviations.")
+    group_id <- as.integer(ranef_new[, random_effect])
+    if (!identical(sort(unique(group_id)), seq_len(max(group_id)))) stop("Random-effect IDs must be consecutive.")
+    random_coefficients <- matrix(
+      rnorm(max(group_id) * n_species, sd = rep(as.numeric(posterior_draw[sd_index]), each = max(group_id))),
+      nrow = max(group_id), ncol = n_species)
+    linear_predictor <- linear_predictor + random_coefficients[group_id, , drop = FALSE]
+  }
+  probability <- pnorm(linear_predictor)
+  colnames(probability) <- colnames(fit$y)
+  probability
+}
+```
+
+# Data preparation
+
+## Read and harmonise eDNA data
+
+```{r read-data}
+sequence_data <- readr::read_csv(sequence_file, show_col_types = FALSE)
+metadata <- readr::read_delim(metadata_file, delim = ";", trim_ws = TRUE, show_col_types = FALSE)
+
+sequence_data <- sequence_data |>
+  dplyr::select(spygen_code, dplyr::where(~ is.numeric(.x) && any(.x != 0, na.rm = TRUE))) |>
+  dplyr::filter(spygen_code %in% metadata$spygen_code)
+
+sampling_data <- metadata |>
+  dplyr::filter(spygen_code %in% sequence_data$spygen_code) |>
+  dplyr::transmute(
+    spygen_code,
+    date = as.Date(date),
+    lat = (latitude_start_DD + latitude_end_DD) / 2,
+    lon = (longitude_start_DD + longitude_end_DD) / 2,
+    mpa_fully = dplyr::recode(as.character(Protection), "1" = "0", "2" = "1"),
+    volume_sampled = dplyr::coalesce(flow_sensor_volume, estimated_volume),
+    depth = NA_real_)
+```
+
+## Extract environmental covariates
+
+For coastal points where a raster value is unavailable, the closest valid cell
+is used and reported in the console.
+
+```{r extract-environment}
+bathymetry <- terra::rast(bathymetry_file)
+for (i in seq_len(nrow(sampling_data))) {
+  
+  extraction <- extract_or_nearest(bathymetry, sampling_data$lon[i], sampling_data$lat[i])
+  sampling_data$depth[i] <- abs(extraction$value)
+  
+  if (extraction$replaced) message("Nearest bathymetry cell used for ", sampling_data$spygen_code[i])
+  
+}
+
+sst_files <- list.files(data_dir, pattern = "SST", full.names = TRUE)
+if (!length(sst_files)) stop("No SST raster files were found in ", data_dir, call. = FALSE)
+sst <- do.call(c, lapply(sst_files, terra::rast))
+sst_dates <- as.Date(terra::time(sst))
+
+sampling_data$temperature <- NA_real_
+sampling_data$temperature_lon <- NA_real_
+sampling_data$temperature_lat <- NA_real_
+
+for (i in seq_len(nrow(sampling_data))) {
+  date_index <- which(sst_dates == sampling_data$date[i])
+  
+  if (!length(date_index)) {
+    warning("No SST layer for ", sampling_data$spygen_code[i], " on ", sampling_data$date[i])
+    next
+  }
+  
+  extraction <- extract_or_nearest(sst[[date_index[1]]], sampling_data$lon[i], sampling_data$lat[i])
+  sampling_data$temperature[i] <- extraction$value - 273.15 # Kelvin to Celsius
+  sampling_data$temperature_lon[i] <- extraction$lon
+  sampling_data$temperature_lat[i] <- extraction$lat
+  if (extraction$replaced) message("Nearest SST cell used for ", sampling_data$spygen_code[i])
+  
+}
+
+sampling_data <- sampling_data |>
+  dplyr::filter(dplyr::between(lat, 39, 44), depth > 0, temperature > 0)
+readr::write_csv(sampling_data, file.path(data_dir, "environmental_data.csv"))
+```
+
+## Build model matrices
+
+```{r model-matrices}
+presence_absence <- sequence_data |>
+  dplyr::filter(spygen_code %in% sampling_data$spygen_code) |>
+  dplyr::mutate(dplyr::across(-spygen_code, ~ as.integer(.x > 0)))
+
+metadata_model <- sampling_data |>
+  dplyr::filter(spygen_code %in% presence_absence$spygen_code, !is.na(volume_sampled)) |>
+  dplyr::arrange(match(spygen_code, presence_absence$spygen_code)) |>
+  dplyr::mutate(
+    date_numeric = as.numeric(date - min(date, na.rm = TRUE)),
+    mpa_fully = factor(mpa_fully),
+    log_volume = log1p(volume_sampled))
+
+presence_absence_model <- presence_absence |>
+  dplyr::filter(spygen_code %in% metadata_model$spygen_code) |>
+  dplyr::arrange(match(spygen_code, metadata_model$spygen_code))
+stopifnot(identical(metadata_model$spygen_code, presence_absence_model$spygen_code))
+
+Y <- as.matrix(dplyr::select(presence_absence_model, -spygen_code))
+storage.mode(Y) <- "numeric"
+stopifnot(all(Y %in% c(0, 1)))
+
+readr::write_csv(metadata_model, file.path(data_dir, "metadata_model.csv"))
+readr::write_csv(presence_absence_model, file.path(data_dir, "eDNA_presence_absence.csv"))
+saveRDS(Y, file.path(data_dir, "Y.rds"))
+```
+
+# Spatial cross-validation
+
+```{r spatial-folds}
+metadata_model <- metadata_model |>
+  dplyr::mutate(
+    station = interaction(round(lon, 6), round(lat, 6), drop = TRUE),
+    date_group = as.character(date))
+metadata_sf <- sf::st_as_sf(metadata_model, 
+                            coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+set.seed(123)
+spatial_cv <- blockCV::cv_spatial(
+  x = metadata_sf, column = NULL, k = length(folds), size = 50000,
+  selection = "random", iteration = 100, biomod2 = FALSE, progress = TRUE)
+
+metadata_model$spatial_fold <- spatial_cv$folds_ids
+stopifnot(setequal(unique(metadata_model$spatial_fold), folds))
+readr::write_csv(metadata_model, file.path(data_dir, "metadata_model.csv"))
+```
+
+## Fit and predict each fold
+
+The fitting chunk is not evaluated when knitting because it is computationally
+demanding. Run it interactively or set `eval = TRUE` on a configured machine.
+
+```{r fit-folds, eval=FALSE}
+species_keep_by_fold <- sapply(folds, function(fold) {
+  training_rows <- metadata_model$spatial_fold != fold
+  n_presence <- colSums(Y[training_rows, , drop = FALSE])
+  n_presence >= 5 & n_presence <= sum(training_rows) - 5
+})
+
+Y_cv <- Y[, apply(species_keep_by_fold, 1, all), drop = FALSE]
+
+for (fold in folds) {
+  message("Fitting fold ", fold, " of ", length(folds))
+  set.seed(123 + fold)
+  test_id <- which(metadata_model$spatial_fold == fold)
+  train_id <- which(metadata_model$spatial_fold != fold)
+  metadata_train <- metadata_model[train_id, , drop = FALSE]
+  metadata_test <- metadata_model[test_id, , drop = FALSE]
+  Y_train <- Y_cv[train_id, , drop = FALSE]
+  Y_test <- Y_cv[test_id, , drop = FALSE]
+
+  x_center <- vapply(metadata_train[continuous_variables], mean, numeric(1), na.rm = TRUE)
+  x_scale <- vapply(metadata_train[continuous_variables], sd, numeric(1), na.rm = TRUE)
+  stopifnot(all(is.finite(x_scale)), all(x_scale > 0))
+  
+  make_X <- function(data) {
+    X <- scale(as.matrix(data[continuous_variables]), 
+               center = x_center, scale = x_scale)
+    X <- cbind(X, 
+               AMP = as.numeric(as.character(data$mpa_fully)))
+    storage.mode(X) <- "numeric"; X
+  }
+  
+  make_ranef <- function(data) {
+    random_effects <- cbind(station = as.integer(factor(data$station)), 
+                            date = as.integer(factor(data$date_group)))
+    storage.mode(random_effects) <- "integer"; random_effects
+  }
+  
+  X_train <- make_X(metadata_train); X_test <- make_X(metadata_test)
+  ranef_train <- make_ranef(metadata_train); ranef_test <- make_ranef(metadata_test)
+  stopifnot(!anyNA(X_train), !anyNA(X_test), !anyNA(ranef_train), !anyNA(ranef_test))
+
+  fit <- boral::boral(
+    y = Y_train, 
+    X = X_train, 
+    family = "binomial", 
+    ranef.ids = ranef_train,
+    lv.control = list(num.lv = 2, type = "independent"),
+    save.model = TRUE,
+    mcmc.control = list(n.burnin = 100,
+                        n.iteration = 500,
+                        n.thin = 5, 
+                        seed = 123 + fold))
+  
+  prediction <- predict(fit, newX = X_test, newranef.ids = ranef_test,
+    predict.type = "marginal", scale = "response", lv.mc = 100, return.alllinpred = FALSE)
+  
+  probability <- prediction$linpred
+  stopifnot(identical(dim(probability), dim(Y_test)))
+
+  saveRDS(fit, file.path(output_dir, paste0("fit_fold", fold, ".rds")))
+  
+  saveRDS(list(test_id = test_id, observed = Y_test, probability = probability,
+    predicted_pa = as.integer(probability >= presence_threshold), x_center = x_center,
+    x_scale = x_scale, ranef_test = ranef_test),
+    file.path(output_dir, paste0("predictions_fold", fold, ".rds")))
+}
+```
+
+# Out-of-fold evaluation
+
+```{r evaluate}
+prediction_files <- file.path(output_dir, paste0("predictions_fold", folds, ".rds"))
+
+fit_files <- file.path(output_dir, paste0("fit_fold", folds, ".rds"))
+
+if (!all(file.exists(c(prediction_files, fit_files)))) stop("Fit all folds before evaluation.", call. = FALSE)
+
+predictions_by_fold <- lapply(prediction_files, readRDS)
+
+all_test_ids <- unlist(lapply(predictions_by_fold, `[[`, "test_id"))
+
+stopifnot(length(all_test_ids) == nrow(metadata_model), 
+          anyDuplicated(all_test_ids) == 0)
+
+species_names <- colnames(predictions_by_fold[[1]]$observed)
+
+oof_probability <- matrix(NA_real_, 
+                          nrow(metadata_model), 
+                          length(species_names), 
+                          dimnames = list(metadata_model$spygen_code, 
+                                          species_names))
+
+oof_observed <- matrix(NA_integer_, 
+                       nrow(metadata_model), 
+                       length(species_names), 
+                       dimnames = dimnames(oof_probability))
+
+fold_summary <- dplyr::bind_rows(lapply(seq_along(folds), function(i) {
+  
+  prediction <- predictions_by_fold[[i]]; test_id <- prediction$test_id
+  
+  stopifnot(identical(colnames(prediction$observed), species_names))
+  
+  oof_probability[test_id, ] <<- prediction$probability
+  
+  oof_observed[test_id, ] <<- prediction$observed
+  
+  data.frame(fold = folds[i], n_train = nrow(metadata_model) - length(test_id), n_test = length(test_id),
+             
+    F1_micro = micro_f1(prediction$observed, prediction$predicted_pa))
+}))
+
+stopifnot(!anyNA(oof_probability), !anyNA(oof_observed))
+
+oof_predicted_pa <- as.integer(oof_probability >= presence_threshold)
+
+marginal_oof_results <- list(
+  probability = oof_probability, observed = oof_observed, predicted_pa = oof_predicted_pa,
+  F1_by_sample = community_f1(oof_observed, oof_predicted_pa),
+  F1_micro = micro_f1(oof_observed, oof_predicted_pa), fold_summary = fold_summary
+)
+saveRDS(marginal_oof_results, file.path(output_dir, "marginal_oof_results.rds"))
+fold_summary
+```
+
+# Posterior community realisations
+
+Each realisation samples one joint posterior draw, new latent scores, and new
+random-effect coefficients. It is thus a plausible community configuration,
+not a repeated thresholding of marginal probabilities.
+
+```{r posterior-draws, eval=FALSE}
+probability_tables_by_fold <- vector("list", length(folds))
+names(probability_tables_by_fold) <- as.character(folds)
+
+for (fold in folds) {
+  
+  message("Generating posterior draws for fold ", fold)
+  
+  fit <- readRDS(file.path(output_dir, paste0("fit_fold", fold, ".rds")))
+  
+  prediction_info <- readRDS(file.path(output_dir, paste0("predictions_fold", fold, ".rds")))
+  
+  test_id <- prediction_info$test_id
+  metadata_test <- metadata_model[test_id, , drop = FALSE]
+  Y_test <- prediction_info$observed
+  X_test <- scale(as.matrix(metadata_test[continuous_variables]), center = prediction_info$x_center, scale = prediction_info$x_scale)
+  X_test <- cbind(X_test, AMP = as.numeric(as.character(metadata_test$mpa_fully)))
+  storage.mode(X_test) <- "numeric"
+  ranef_test <- as.matrix(prediction_info$ranef_test); storage.mode(ranef_test) <- "integer"
+  
+  stopifnot(identical(colnames(Y_test), colnames(fit$y)), identical(colnames(X_test), colnames(fit$X)),
+    identical(colnames(ranef_test), colnames(fit$ranef.ids)))
+
+  mcmc_samples <- as.matrix(boral::get.mcmcsamples(fit))
+  set.seed(1000 + fold)
+  posterior_rows <- sample(seq_len(nrow(mcmc_samples)), 
+                           n_posterior_draws, 
+                           replace = nrow(mcmc_samples) < n_posterior_draws)
+  
+  probability_array <- simplify2array(lapply(posterior_rows, function(row) {
+    
+    simulate_posterior_probability(fit, mcmc_samples, row, X_test, ranef_test)
+  }))
+  
+  dimnames(probability_array) <- list(spygen_code = metadata_test$spygen_code,
+                                      species = colnames(Y_test), 
+                                      draw = paste0("draw_", seq_len(n_posterior_draws)))
+
+  probability_matrix <- matrix(aperm(probability_array, c(3, 1, 2)),
+    nrow = nrow(Y_test) * n_posterior_draws,
+    ncol = ncol(Y_test),
+    dimnames = list(NULL, colnames(Y_test)))
+  
+  probability_table <- dplyr::bind_cols(
+    data.frame(row_id = rep(test_id, 
+                            each = n_posterior_draws),
+               spygen_code = rep(metadata_test$spygen_code,
+                                 each = n_posterior_draws),
+               fold = fold,
+               draw = rep(seq_len(n_posterior_draws),
+                          times = nrow(Y_test))),
+    as.data.frame(probability_matrix, check.names = FALSE))
+  
+  saveRDS(list(test_id = test_id,
+               spygen_code = metadata_test$spygen_code,
+               posterior_rows = posterior_rows,
+               probability_array = probability_array),
+          file.path(output_dir, 
+                    paste0("probability_array_fold", fold, "_", n_posterior_draws, ".rds")))
+  
+  saveRDS(probability_table,
+          file.path(output_dir, paste0("probability_table_fold", fold, "_", n_posterior_draws, ".rds")))
+  
+  probability_tables_by_fold[[as.character(fold)]] <- probability_table
+}
+
+probability_draws <- dplyr::bind_rows(probability_tables_by_fold) |>
+  dplyr::arrange(row_id, draw)
+
+stopifnot(nrow(probability_draws) == nrow(metadata_model) * n_posterior_draws)
+
+readr::write_csv(probability_draws, file.path(output_dir, paste0("probability_draws_", n_posterior_draws, ".csv")))
+saveRDS(probability_draws, file.path(output_dir, paste0("probability_draws_", n_posterior_draws, ".rds")))
+```
+
+# Export shareable data
+
+The following export is a public release using 50-km grid-centroid
+coordinates, but retains sampling dates and covariates.
+
+```{r export-data}
+metadata_50km <- metadata_model |>
+  sf::st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE) |>
+  sf::st_transform(3035)
+grid_sf <- sf::st_sf(grid_id = seq_along(sf::st_make_grid(metadata_50km, 
+                                                          cellsize = 50000, 
+                                                          square = TRUE)),
+  geometry = sf::st_make_grid(metadata_50km, 
+                              cellsize = 50000, 
+                              square = TRUE))
+
+metadata_50km <- sf::st_join(metadata_50km, grid_sf)
+
+centroids <- sf::st_transform(sf::st_centroid(grid_sf), 4326)
+centroid_coordinates <- sf::st_coordinates(centroids)
+grid_sf$lon_50km <- centroid_coordinates[, "X"]
+grid_sf$lat_50km <- centroid_coordinates[, "Y"]
+
+shared_data <- metadata_50km |>
+  sf::st_drop_geometry() |>
+  dplyr::left_join(sf::st_drop_geometry(grid_sf) |>
+    dplyr::select(grid_id, lon_50km, lat_50km), 
+    by = "grid_id") |>
+  dplyr::select(spygen_code, 
+                date, 
+                depth, 
+                mpa_fully, 
+                volume_sampled, 
+                temperature,
+                spatial_fold,
+                lon_50km,
+                lat_50km) |>
+  dplyr::left_join(presence_absence_model, by = "spygen_code")
+
+readr::write_csv(shared_data, file.path(data_dir, "Coulon_et_al_2027_eDNA_data.csv"))
+```
