@@ -4,7 +4,7 @@
 
 - The script requires the R packages listed in its configuration section. It does not install packages automatically.
 - Sample-level eDNA data and environmental covariates are not distributed with this repository.
-- The 50-km aggregated dataset is provided separately for data sharing and reuse. It cannot be used to rerun the analyses in 04_eDNA.Rmd.
+- The 50-km aggregated dataset is provided separately for data sharing and reuse (DOI: 10.5061/dryad.cnp5hqcn3). It cannot be used to rerun the analyses in 04_eDNA.Rmd.
   
 The eDNA script is therefore provided as transparent analytical documentation rather than as an executable reproducibility package.
 
