@@ -1,6 +1,6 @@
 # eDNA JOINT SPECIES DISTRIBUTION MODEL
 
-04_eDNA.Rmd documents the workflow used to prepare eDNA data, fit spatially blocked joint species distribution models using boral, evaluate marginal predictions, and generate posterior community realisations for the best-of-N analysis.
+eDNA data preparation & Bayesian jSDM implementation.Rmd. documents the workflow used to prepare eDNA data, fit spatially blocked joint species distribution models using boral, evaluate marginal predictions, and generate posterior community realisations for the best-of-N analysis.
 
 - The script requires the R packages listed in its configuration section. It does not install packages automatically.
 - Sample-level eDNA data and environmental covariates are not distributed with this repository.
