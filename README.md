@@ -1,10 +1,20 @@
+# eDNA JOINT SPECIES DISTRIBUTION MODEL
+
+04_eDNA.Rmd documents the workflow used to prepare eDNA data, fit spatially blocked joint species distribution models using boral, evaluate marginal predictions, and generate posterior community realisations for the best-of-N analysis.
+
+- The script requires the R packages listed in its configuration section. It does not install packages automatically.
+- Sample-level eDNA data and environmental covariates are not distributed with this repository.
+- The 50-km aggregated dataset is provided separately for data sharing and reuse. It cannot be used to rerun the analyses in 04_eDNA.Rmd.
+  
+The eDNA script is therefore provided as transparent analytical documentation rather than as an executable reproducibility package.
+
 # TRAINING MLP AND AR MODELS
-- Install required dependencies using `python -m pip install -r requirements.txt`
-- Use the `training.py` script for the training of the marignal and autoregressive models.
+- Install the required dependencies using `python -m pip install -r requirements.txt`
+- Use `training.py`  to train the marignal and autoregressive models.
 - `torchrun` can be used for distributed learning.
-- Add your configuration parameters in the `config.cfg file`. For a simple example, all parameters should be already configurated.
+- Set the configuration parameters in `config.cfg file`. Example settings are already provided.
 
 # EVALUATING MODELS
-- Add the models you evaluated in "Evaluated Instances" of the `config.cfg`file. All 3 types of models are already in example for configuration.
-- Run the `evaluation.py` script. `torchrun`can also be used in this case.
-- Plot should be saved under the `fi_curve.png` in the main directory.
+- Specify the models to evaluate in the "Evaluated Instances" section of the `config.cfg`file. Example configurations for all three model types are provided.
+- Run `evaluation.py`. `torchrun`can also be used for distributed evaluation.
+- Plots are saved as `fi_curve.png` in the main directory.
